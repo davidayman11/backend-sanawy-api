@@ -1,106 +1,92 @@
-// server.js
-require('dotenv').config();
+// lib/services/auth_api_service.dart
+import 'dart:convert';
+import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
 
-const path = require('path');
-const express = require('express');
-const cors = require('cors');
-const mongoose = require('mongoose');
+class AuthApiService {
+  static const String loginUrl = 'http://13.48.212.255:6060/api/auth/login';
+  static const String _cookieKey = 'auth_cookies';
+  static const String _tokenKey  = 'auth_token';
 
-const app = express();
-const PORT = process.env.PORT || 6060;
+  /// Login with username & password.
+  /// Saves cookies (and token if the API also returns one).
+  Future<Map<String, dynamic>> login({
+    required String username,
+    required String password,
+  }) async {
+    final uri = Uri.parse(loginUrl);
+    final res = await http.post(
+      uri,
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({
+        'username_up': username,
+        'Password_up': password,
+      }),
+    );
 
-// ---------- Connect to Mongo ----------
-(async () => {
-  try {
-    if (!process.env.MONGODB_URI) {
-      console.error('❌ Missing MONGODB_URI in .env');
-      process.exit(1);
+    if (res.statusCode < 200 || res.statusCode >= 300) {
+      String msg = 'Login failed (${res.statusCode})';
+      try {
+        final body = jsonDecode(res.body);
+        if (body is Map && body['message'] != null) msg = body['message'].toString();
+      } catch (_) {}
+      throw Exception(msg);
     }
-    await mongoose.connect(process.env.MONGODB_URI);
-    console.log('✅ MongoDB connected');
-  } catch (err) {
-    console.error('MongoDB connect error:', err.message);
-    process.exit(1);
+
+    // ---- Parse body as JSON (for optional token etc.) ----
+    final data = (jsonDecode(res.body) as Map).cast<String, dynamic>();
+
+    // Optional bearer token (keep your old behavior)
+    final token = (data['token'] ?? data['access_token'] ?? data['accessToken'])?.toString();
+
+    // ---- Capture cookies from Set-Cookie header(s) ----
+    // package:http exposes a single, merged string at 'set-cookie'
+    final setCookieHeader = res.headers['set-cookie']; // may be null
+    final cookieHeader = _cookieHeaderFromSetCookie(setCookieHeader);
+
+    final prefs = await SharedPreferences.getInstance();
+    if (token != null) await prefs.setString(_tokenKey, token);
+    if (cookieHeader != null) await prefs.setString(_cookieKey, cookieHeader);
+
+    return data;
   }
-})();
 
-// ---------- Middleware ----------
-app.use(express.json({ limit: '2mb' }));
-app.use(express.urlencoded({ extended: true }));
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+  /// Build a Cookie header (e.g. "sid=...; Path=/; HttpOnly" -> "sid=...")
+  /// Supports multiple cookies in one string.
+  String? _cookieHeaderFromSetCookie(String? setCookie) {
+    if (setCookie == null || setCookie.isEmpty) return null;
 
-// ---------- CORS ----------
-const allowed = (process.env.ALLOWED_ORIGINS || '')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
+    // Extract every "name=value;" pair without attributes
+    final reg = RegExp(r'(?:(^|,)\s*)([^=;,]+)=([^;,\r\n]+)');
+    final matches = reg.allMatches(setCookie);
 
-app.use(cors({
-  origin: function (origin, cb) {
-    if (!origin) return cb(null, true); // allow tools like Postman
-    if (allowed.includes(origin)) return cb(null, true);
-    return cb(new Error('CORS blocked for origin: ' + origin), false);
-  },
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
-  credentials: true,
-}));
+    final Map<String, String> pairs = {};
+    for (final m in matches) {
+      final name = m.group(2)?.trim();
+      final value = m.group(3)?.trim();
+      if (name != null && value != null && name.isNotEmpty) {
+        pairs[name] = value; // last one wins
+      }
+    }
+    if (pairs.isEmpty) return null;
 
-// Preflight response
-app.options('*', (req, res) => {
-  const origin = req.headers.origin;
-  if (origin && allowed.includes(origin)) {
-    res.setHeader('Access-Control-Allow-Origin', origin);
-    res.setHeader('Vary', 'Origin');
-    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
-    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    // Compose Cookie header: "name=value; name2=value2"
+    return pairs.entries.map((e) => '${e.key}=${e.value}').join('; ');
   }
-  return res.sendStatus(204);
-});
 
-// ---------- Routes ----------
-try {
-  const authRoutes = require('./routes/auth');
-  const studentsRoutes = require('./routes/students');
-  const attendanceRoutes = require('./routes/attendance');
-  const pointsRoutes = require('./routes/points');
-  const rankingsRoutes = require('./routes/rankings');
-  const emailRoutes = require('./routes/email');
+  Future<String?> getSavedToken() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString(_tokenKey);
+  }
 
-  app.use('/api/auth', authRoutes);
-  app.use('/api/students', studentsRoutes);
-  app.use('/api/attendance', attendanceRoutes);
-  app.use('/api/points', pointsRoutes);
-  app.use('/api/rankings', rankingsRoutes);
-  app.use('/api/email', emailRoutes);
-} catch (e) {
-  console.warn('⚠️ Some route files missing:', e.message);
+  Future<String?> getSavedCookies() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString(_cookieKey);
+  }
+
+  Future<void> logout() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(_tokenKey);
+    await prefs.remove(_cookieKey);
+  }
 }
-
-// Health check route
-app.get('/api/health', (_req, res) => {
-  res.json({ ok: true, time: new Date().toISOString() });
-});
-
-// ---------- 404 ----------
-app.use((req, res) => {
-  if (req.method === 'OPTIONS') return res.sendStatus(204);
-  res.status(404).json({ error: 'Not Found', path: req.originalUrl });
-});
-
-// ---------- Error handler ----------
-app.use((err, req, res, _next) => {
-  console.error('❌ Error:', err.message);
-  const origin = req.headers.origin;
-  if (origin && allowed.includes(origin)) {
-    res.setHeader('Access-Control-Allow-Origin', origin);
-    res.setHeader('Vary', 'Origin');
-  }
-  res.status(500).json({ error: err.message || 'Server Error' });
-});
-
-// ---------- Start server ----------
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-});
