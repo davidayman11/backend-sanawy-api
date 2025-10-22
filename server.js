@@ -5,9 +5,14 @@ const path = require('path');
 const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
+const session = require('express-session');
+const MongoStore = require('connect-mongo');
 
 const app = express();
 const PORT = process.env.PORT || 6060;
+
+// If you deploy behind a proxy (nginx/render/heroku), leave this on:
+app.set('trust proxy', 1);
 
 // ---------- Connect to Mongo ----------
 (async () => {
@@ -35,29 +40,53 @@ const allowed = (process.env.ALLOWED_ORIGINS || '')
   .map(s => s.trim())
   .filter(Boolean);
 
+console.log('CORS allowed origins:', allowed);
+
 app.use(cors({
-  origin: function (origin, cb) {
-    if (!origin) return cb(null, true); // allow tools like Postman
+  origin(origin, cb) {
+    // Allow tools with no Origin (curl/Postman/native apps)
+    if (!origin) return cb(null, true);
     if (allowed.includes(origin)) return cb(null, true);
     return cb(new Error('CORS blocked for origin: ' + origin), false);
   },
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
   credentials: true,
+  methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization','X-Requested-With']
 }));
 
-// Preflight response
-app.options('*', (req, res) => {
-  const origin = req.headers.origin;
-  if (origin && allowed.includes(origin)) {
-    res.setHeader('Access-Control-Allow-Origin', origin);
-    res.setHeader('Vary', 'Origin');
-    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
-    res.setHeader('Access-Control-Allow-Credentials', 'true');
+// Handle preflight universally
+app.options('*', cors());
+
+// ---------- Sessions (cookie-based auth) ----------
+/**
+ * Local HTTP dev (same machine):
+ *   sameSite: 'lax', secure: false
+ *
+ * Cross-site production over HTTPS (web app domain ≠ API domain):
+ *   sameSite: 'none', secure: true  <-- API MUST be HTTPS then
+ *
+ * Switch via COOKIE_MODE env:
+ *   COOKIE_MODE=dev                 -> lax / not secure
+ *   COOKIE_MODE=cross-site-https    -> none / secure
+ */
+const isCrossSiteHttps = process.env.COOKIE_MODE === 'cross-site-https';
+
+if (!process.env.SESSION_SECRET) {
+  console.warn('⚠️ Missing SESSION_SECRET in .env (using dev default).');
+}
+
+app.use(session({
+  secret: process.env.SESSION_SECRET || 'dev-secret-change-me',
+  resave: false,
+  saveUninitialized: false,
+  store: MongoStore.create({ mongoUrl: process.env.MONGODB_URI }),
+  cookie: {
+    httpOnly: true,
+    maxAge: 24 * 60 * 60 * 1000, // 1 day
+    sameSite: isCrossSiteHttps ? 'none' : 'lax',
+    secure: isCrossSiteHttps
   }
-  return res.sendStatus(204);
-});
+}));
 
 // ---------- Routes ----------
 try {
@@ -67,6 +96,7 @@ try {
   const pointsRoutes = require('./routes/points');
   const rankingsRoutes = require('./routes/rankings');
   const emailRoutes = require('./routes/email');
+  const dashboardRoutes = require('./routes/dashboard');
 
   app.use('/api/auth', authRoutes);
   app.use('/api/students', studentsRoutes);
@@ -74,6 +104,8 @@ try {
   app.use('/api/points', pointsRoutes);
   app.use('/api/rankings', rankingsRoutes);
   app.use('/api/email', emailRoutes);
+  app.use('/api/dashboard', dashboardRoutes);
+  console.log('✅ Routes mounted');
 } catch (e) {
   console.warn('⚠️ Some route files missing:', e.message);
 }
@@ -96,6 +128,7 @@ app.use((err, req, res, _next) => {
   if (origin && allowed.includes(origin)) {
     res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
   }
   res.status(500).json({ error: err.message || 'Server Error' });
 });
